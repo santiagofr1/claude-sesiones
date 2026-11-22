@@ -301,6 +301,8 @@ class TestJunkOldEmpty(Base):
         self.pm = self.proj("-solo-memoria")
         os.makedirs(os.path.join(self.pm, "memory"))
         open(os.path.join(self.pm, "memory", "m.md"), "w").write("recuerdo")
+        self.pmv = self.proj("-memoria-vacia")
+        os.makedirs(os.path.join(self.pmv, "memory"))
         self.pcm = self.proj("-con-sesion-y-memoria")
         self.mk(self.pcm, U_SOLO, conv(self.alive))
         os.makedirs(os.path.join(self.pcm, "memory"))
@@ -331,6 +333,8 @@ class TestJunkOldEmpty(Base):
         hu = os.listdir(os.path.join(pap, "_huerfanos"))
         self.assertTrue(any(h.endswith(U_ORPH) for h in hu))
         self.assertFalse(os.path.exists(self.pe))
+        # proyecto con memory/ vacia: se borra todo
+        self.assertFalse(os.path.exists(self.pmv))
         # proyecto con solo memory: memory a _huerfanos, carpeta borrada
         self.assertFalse(os.path.exists(self.pm))
         self.assertTrue(any(h.endswith("-solo-memoria") for h in hu))

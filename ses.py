@@ -751,6 +751,8 @@ def junk_project(o):
     if os.path.isdir(mem) and not os.path.islink(mem) and os.listdir(mem):
         to_huerfanos(mem, o["name"], "memory", "memoria de proyecto vacio", memory="proj", tipo="memoria")
         msg = "memoria a la papelera (_huerfanos) y carpeta borrada"
+    elif os.path.isdir(mem) and not os.path.islink(mem):
+        os.rmdir(mem)  # memory/ vacia: no hay nada que guardar
     check_proj_rmdir(pd)
     os.rmdir(pd)
     return msg
