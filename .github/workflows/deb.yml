@@ -1,0 +1,73 @@
+# En cada push a la rama principal: corre los tests, arma el .deb, lo publica
+# como Release y borra los Releases viejos (se quedan los últimos KEEP).
+name: deb
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deb-release
+  cancel-in-progress: false
+
+env:
+  KEEP: 5
+  BASE_VERSION: "1.0"
+
+jobs:
+  deb:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Versión (base + número de build)
+        id: ver
+        run: |
+          v="${BASE_VERSION}.${{ github.run_number }}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Armar .deb
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p dist
+          bash packaging/build-deb.sh "$V" dist
+
+      - name: Publicar Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          gh release create "v$V" dist/claude-sesiones_all.deb \
+            --target "$GITHUB_SHA" --latest \
+            --title "claude-sesiones $V" \
+            --notes "Build automático de ${GITHUB_SHA::7}.
+
+          \`\`\`
+          sudo apt install ./claude-sesiones_all.deb
+          \`\`\`"
+
+      - name: Borrar Releases viejos
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 200 --json tagName,createdAt \
+            --jq "sort_by(.createdAt) | reverse | .[${KEEP}:] | .[].tagName" |
+          while read -r tag; do
+            gh release delete "$tag" --yes --cleanup-tag
+          done
+
+      - name: Avisar al repo apt (santiagofr1/apt)
+        # sin el secret no pasa nada: el repo apt igual lo levanta en menos de una hora
+        env:
+          TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+        run: |
+          [ -n "$TOKEN" ] || { echo "sin APT_DISPATCH_TOKEN, lo levanta el cron"; exit 0; }
+          GH_TOKEN="$TOKEN" gh api repos/santiagofr1/apt/dispatches -f event_type=publish
