@@ -332,6 +332,137 @@ def artifacts_of(s):
     return {k: v for k, v in cands.items() if os.path.lexists(v)}
 
 
+# ---------------------------------------------------------------- salida en vivo
+def term_width():
+    if not sys.stdout.isatty():
+        return None
+    return shutil.get_terminal_size((100, 24)).columns
+
+
+def fit(text):
+    """Corta a lo ancho de la terminal (solo si es TTY)."""
+    w = term_width()
+    if w and len(text) > w - 1:
+        return text[: max(0, w - 4)] + "..."
+    return text
+
+
+def plural(n, uno, varios):
+    return "%d %s" % (n, uno if n == 1 else varios)
+
+
+def row(kind, ident, size, rest=""):
+    """Linea corta y alineada: tipo, id, tamano, detalle."""
+    sz = human(size) if size is not None else ""
+    return ("%-8s %-8s %9s  %s" % (kind, ident, sz, rest)).rstrip()
+
+
+class Status:
+    """Linea de estado que se reescribe con \r (solo TTY; si no, no hace nada)."""
+
+    def __init__(self):
+        self.on = sys.stdout.isatty()
+        self.shown = False
+        self.last = 0.0
+
+    def update(self, text, force=False):
+        if not self.on:
+            return
+        now = time.time()
+        if not force and now - self.last < 0.1:
+            return
+        self.last = now
+        w = term_width() or 80
+        t = fit(text)
+        sys.stdout.write("\r" + t + " " * max(0, w - 1 - len(t)) + "\r")
+        sys.stdout.flush()
+        self.shown = True
+
+    def clear(self):
+        if self.on and self.shown:
+            w = term_width() or 80
+            sys.stdout.write("\r" + " " * (w - 1) + "\r")
+            sys.stdout.flush()
+        self.shown = False
+
+
+class Report:
+    """Salida en vivo por secciones, contadores y resumen final."""
+    LABELS = collections.OrderedDict([
+        ("ses", ("sesion", "sesiones")), ("mem", ("memoria", "memorias")),
+        ("flow", (".claude-flow", ".claude-flow")),
+        ("hue", ("artefacto huerfano", "artefactos huerfanos")),
+        ("proj", ("proyecto vacio", "proyectos vacios"))])
+
+    def __init__(self, dry=False):
+        self.dry = dry
+        self.seen = set()
+        self.n = collections.Counter()
+        self.b = collections.Counter()
+        self.activas = 0
+        self.errores = 0
+
+    def section(self, name):
+        if name not in self.seen:
+            self.seen.add(name)
+            if len(self.seen) > 1:
+                print(flush=True)
+            print(col(name, "1"), flush=True)
+
+    def line(self, text):
+        print(fit(text), flush=True)
+
+    def add(self, kind, size=0):
+        self.n[kind] += 1
+        self.b[kind] += size or 0
+
+    def fail(self, ident, motivo, activa=False):
+        if activa:
+            self.activas += 1
+        else:
+            self.errores += 1
+        sys.stdout.flush()
+        print(col(fit("no se pudo  %s  %s" % (ident, motivo)), "31"), file=sys.stderr, flush=True)
+
+    def moved(self):
+        return sum(self.n.values())
+
+    def summary(self):
+        parts = []
+        for k, (uno, varios) in self.LABELS.items():
+            if not self.n[k]:
+                continue
+            t = plural(self.n[k], uno, varios)
+            if k in ("ses", "flow"):
+                t += " (%s)" % human(self.b[k])
+            parts.append(t)
+        total = sum(self.b.values())
+        print(file=sys.stdout, flush=True)
+        if parts:
+            print("%s %s. Total: %s." % ("Se llevaria:" if self.dry else "Listo:", ", ".join(parts), human(total)),
+                  flush=True)
+        self.fails_line()
+        if self.dry:
+            print("Modo --dry-run: no se modifico nada.", flush=True)
+        else:
+            self.hint()
+
+    def fails_line(self):
+        fails = self.activas + self.errores
+        if fails:
+            why = []
+            if self.activas:
+                why.append("activas" if not self.errores else "%d activas" % self.activas)
+            if self.errores:
+                why.append("con error" if not self.activas else "%d con error" % self.errores)
+            print("%s (%s)." % (plural(fails, "no se pudo", "no se pudieron"), ", ".join(why)), flush=True)
+
+    def hint(self):
+        if self.moved() and not self.dry:
+            print("Todo quedo en la papelera. Para recuperar algo: ses restore <id>  (ses restore lista todo)",
+                  flush=True)
+
+
 # ---------------------------------------------------------------- papelera
 def papelera():
     return os.path.join(root(), "ses-papelera")
@@ -597,19 +728,22 @@ def cmd_ver(a):
     return 0
 
 
-def report_trash(s):
-    print("%s  %s  (%s)" % (col(s["uuid"][:8], "36"), s["title"], tilde(s["proyecto"])))
-    print("   restaura con: ses restore %s" % s["uuid"][:8])
+def session_row(s, rest=None):
+    return row("sesion", s["uuid"][:8], s["size"],
+               "%-24s %s" % (one_line(tilde(s["proyecto"]), 24),
+                             one_line(rest if rest is not None else s["title"], 60)))
 
 
-def trash_many(sessions, mem_filter=None):
+def trash_many(sessions, mem_filter=None, rep=None):
     """Manda a la papelera; memory del proyecto va con la ultima sesion del proyecto."""
+    rep = rep or Report()
     rc = 0
     ok_list = []
+    if sessions:
+        rep.section("Sesiones")
     for s in sessions:
         if is_active(s["mtime"]):
-            print("%s: rechazada, modificada hace menos de %g min (activa): %s"
-                  % (s["uuid"][:8], activa_seg() / 60, s["title"]), file=sys.stderr)
+            rep.fail(s["uuid"][:8], "activa, modificada hace menos de %g min" % (activa_seg() / 60), activa=True)
             rc = 1
         else:
             ok_list.append(s)
@@ -632,18 +766,23 @@ def trash_many(sessions, mem_filter=None):
                 protected_note = False
             if want and (prot or (mem_filter and not mem_filter(pd))):
                 want = False
+            memdir = os.path.join(pd, "memory")
+            msz = tree_size(memdir) if want and os.path.isdir(memdir) else 0
             try:
                 took = trash_session(s, take_memory=want)
             except SesError as e:
-                print("%s: error: %s" % (s["uuid"][:8], e), file=sys.stderr)
+                rep.fail(s["uuid"][:8], e)
                 rc = 1
                 good = False
                 continue
-            report_trash(s)
+            rep.add("ses", s["size"])
+            rep.line(session_row(s))
             if protected_note:
-                print("   memoria protegida (home): %s" % tilde(s["proyecto"]))
+                rep.line("    memoria protegida (home): %s" % tilde(s["proyecto"]))
             if took:
-                print("   tambien se llevo la memoria del proyecto %s" % tilde(s["proyecto"]))
+                rep.add("mem", msz)
+                rep.line(row("memoria", "", msz, "%-24s con la ultima sesion"
+                             % one_line(tilde(s["proyecto"]), 24)))
         try:
             if os.path.isdir(pd) and not os.listdir(pd) and not project_protected(pd, grp[0].get("cwd")):
                 check_proj_rmdir(pd)
@@ -661,12 +800,16 @@ def cmd_borrar(a):
         try:
             s = resolve(i, ss)
         except SesError as e:
-            print("error: %s" % e, file=sys.stderr)
+            print("error: %s" % e, file=sys.stderr, flush=True)
             rc = 1
             continue
         if all(s["uuid"] != x["uuid"] for x in sel):
             sel.append(s)
-    return trash_many(sel) or rc
+    rep = Report()
+    rc = trash_many(sel, rep=rep) or rc
+    rep.fails_line()
+    rep.hint()
+    return rc
 
 
 def cmd_restaurar(a):
@@ -679,7 +822,7 @@ def cmd_restaurar(a):
             kind = "[%s] " % e["tipo"] if e.get("huerfano") else ""
             print("%s  %s  %s  %s%s" % (e["uuid"][:8], e["borrada"], tilde(e["proyecto"]), kind,
                                         one_line(e["title"], 60)))
-        print("\nRestaura con: ses restore <id>")
+        print("\nPara recuperar algo: ses restore <id>")
         return 0
     e = resolve(a.id, es, "sesion en la papelera")
     restore_entry(e)
@@ -764,26 +907,47 @@ def cmd_junk(a):
     if not found:
         print("No se encontro basura.")
         return 0
-    for kind, why, o in found:
-        label = o.get("uuid", "")[:8] if kind != "proyecto" else o["name"]
-        print("%-9s %-44s %s" % (kind, why, label + ("  " + o["title"] if kind == "sesion" else "")))
-    print("\n%d elementos." % len(found))
+    rep = Report(a.dry_run)
     if a.dry_run:
-        print("Modo --dry-run: no se modifico nada.")
+        for kind, titulo in (("sesion", "Sesiones"), ("huerfano", "Artefactos huerfanos"),
+                             ("proyecto", "Proyectos vacios")):
+            for k, why, o in found:
+                if k != kind:
+                    continue
+                rep.section(titulo)
+                if k == "sesion":
+                    rep.add("ses", o["size"])
+                    rep.line(session_row(o, "%s  %s" % (why, o["title"])))
+                elif k == "huerfano":
+                    sz = tree_size(o["path"])
+                    rep.add("hue", sz)
+                    rep.line(row("huerfano", o["uuid"][:8], sz, why))
+                else:
+                    rep.add("proj")
+                    rep.line(row("proyecto", "", None, "%s  %s" % (why, o["name"])))
+        rep.summary()
         return 0
-    rc = trash_many([o for k, _w, o in found if k == "sesion"])
+    rc = trash_many([o for k, _w, o in found if k == "sesion"], rep=rep)
     for kind, why, o in found:
         try:
             if kind == "huerfano":
                 if is_active(o["mtime"]):
                     raise SesError("activo, no se toca")
+                sz = tree_size(o["path"])
                 to_huerfanos(o["path"], o["uuid"], o["uuid"], "artefacto huerfano")
-                print("a la papelera (_huerfanos): %s" % o["uuid"][:8])
+                rep.section("Artefactos huerfanos")
+                rep.add("hue", sz)
+                rep.line(row("huerfano", o["uuid"][:8], sz, "a _huerfanos"))
             elif kind == "proyecto":
-                print("%s: %s" % (o["name"], junk_project(o)))
+                msg = junk_project(o)
+                rep.section("Proyectos vacios")
+                if not msg.startswith(("memoria protegida", "ya no existe")):
+                    rep.add("proj")
+                rep.line(row("proyecto", "", None, "%s  %s" % (msg, o["name"])))
         except (SesError, OSError) as e:
-            print("no se pudo %s: %s" % (o.get("uuid", o.get("name"))[:30], e), file=sys.stderr)
+            rep.fail(o.get("uuid", o.get("name"))[:30], e)
             rc = 1
+    rep.summary()
     return rc
 
 
@@ -800,7 +964,7 @@ def flow_root():
     return os.environ.get("SES_FLOW_ROOT") or os.path.expanduser("~")
 
 
-def find_flows():
+def find_flows(progress=None):
     rt = os.path.realpath(flow_root())
     if not os.path.isdir(rt):
         return []
@@ -808,6 +972,8 @@ def find_flows():
     pap = os.path.realpath(papelera())
     res = []
     for dp, dirnames, _f in os.walk(rt, followlinks=False, onerror=lambda e: None):
+        if progress:
+            progress("buscando .claude-flow... %d encontradas, revisando %s" % (len(res), tilde(dp)))
         keep = []
         for d in dirnames:
             p = os.path.join(dp, d)
@@ -826,7 +992,9 @@ def find_flows():
             keep.append(d)
         dirnames[:] = keep
     out = []
-    for p in sorted(res):
+    for i, p in enumerate(sorted(res)):
+        if progress:
+            progress("midiendo .claude-flow... %d/%d, %s" % (i + 1, len(res), tilde(p)))
         m = newest_mtime(p) or os.lstat(p).st_mtime
         out.append(dict(path=p, mtime=m, size=tree_size(p)))
     return out
@@ -842,11 +1010,14 @@ def check_flow_safe(p):
         raise SesError("fuera de la raiz: %s" % p)
 
 
-def trash_flows(flows):
+def trash_flows(flows, rep=None):
+    rep = rep or Report()
     rc = 0
     base = os.path.join(papelera(), "_flow")
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     n = 0
+    if flows:
+        rep.section(".claude-flow")
     for f in flows:
         try:
             check_flow_safe(f["path"])
@@ -866,16 +1037,12 @@ def trash_flows(flows):
             except Exception as e:
                 cleanup_empty(d)
                 raise e if isinstance(e, SesError) else SesError(str(e))
-            print("a la papelera (_flow): %s" % tilde(f["path"]))
+            rep.add("flow", f["size"])
+            rep.line(row("flow", "", f["size"], tilde(f["path"])))
         except SesError as e:
-            print("no se pudo mover %s: %s" % (tilde(f["path"]), e), file=sys.stderr)
+            rep.fail(tilde(f["path"]), e)
             rc = 1
     return rc
-
-
-def print_flows(flows):
-    for f in flows:
-        print("flow     %8s  %s  %s" % (human(f["size"]), fmt_ts(f["mtime"]), tilde(f["path"])))
 
 
 def newest_mtime(p):
@@ -893,6 +1060,8 @@ def cmd_old(a):
     if a.dias <= 0:
         raise UsageError("<dias> tiene que ser un entero mayor a 0")
     lim = time.time() - a.dias * 86400
+    st = Status()
+    st.update("leyendo sesiones...", force=True)
     all_s = scan()
     ss = [s for s in all_s if s["mtime"] < lim]
     if a.project:
@@ -912,47 +1081,68 @@ def cmd_old(a):
         if a.project and a.project.lower() not in name.lower():
             continue
         if project_protected(pd, sess[0]["cwd"] if sess else None):
-            print("memoria protegida (home): %s" % tilde(name))
+            st.clear()
+            print("memoria protegida (home): %s" % tilde(name), flush=True)
             continue
         if newest_mtime(mem) >= lim:
             continue
         if any(s["mtime"] >= lim for s in sess):
             continue
         mems.append(dict(path=mem, pd=pd, name=name, folder=os.path.basename(pd), sessions=sess))
-    flows = find_flows()
+    try:
+        flows = find_flows(st.update)
+    finally:
+        st.clear()
     if not ss and not mems and not flows:
         print("No hay sesiones ni memorias con mas de %d dias, ni carpetas .claude-flow." % a.dias)
         return 0
-    for s in ss:
-        print("sesion   %s  %s  %8s  %s  %s" % (s["uuid"][:8], fmt_ts(s["mtime"]), human(s["size"]),
-                                                tilde(s["proyecto"]), s["title"]))
-    for m in mems:
-        why = ("viaja con la ultima sesion del proyecto" if m["sessions"]
-               else "va a la papelera (_huerfanos), el proyecto no tiene sesiones")
-        print("memoria  %s  sin uso hace mas de %d dias; %s" % (tilde(m["name"]), a.dias, why))
-    print_flows(flows)
-    print("\n%d sesiones (%s), %d memorias, %d .claude-flow (%s)"
-          % (len(ss), human(sum(s["size"] for s in ss)), len(mems), len(flows),
-             human(sum(f["size"] for f in flows))))
+    rep = Report(a.dry_run)
     if a.dry_run:
-        print("Modo --dry-run: no se modifico nada.")
+        if ss:
+            rep.section("Sesiones")
+        for s in ss:
+            rep.add("ses", s["size"])
+            rep.line(session_row(s))
+        if mems:
+            rep.section("Memorias")
+        for m in mems:
+            msz = tree_size(m["path"])
+            rep.add("mem", msz)
+            rep.line(mem_row(m, msz))
+        if flows:
+            rep.section(".claude-flow")
+        for f in flows:
+            rep.add("flow", f["size"])
+            rep.line(row("flow", "", f["size"], tilde(f["path"])))
+        rep.summary()
         return 0
     ok_dirs = {m["pd"] for m in mems}
-    rc = trash_many(ss, mem_filter=lambda pd: pd in ok_dirs)
-    rc = trash_flows(flows) or rc
+    rc = trash_many(ss, mem_filter=lambda pd: pd in ok_dirs, rep=rep)
     for m in mems:
         if m["sessions"]:
             continue
         try:
+            msz = tree_size(m["path"])
             to_huerfanos(m["path"], m["folder"], "memory", "memoria sin uso", memory="proj", tipo="memoria")
-            print("tambien se llevo la memoria del proyecto %s (a _huerfanos)" % tilde(m["name"]))
+            rep.section("Memorias")
+            rep.add("mem", msz)
+            rep.line(mem_row(m, msz))
             if os.path.isdir(m["pd"]) and not os.listdir(m["pd"]):
                 check_proj_rmdir(m["pd"])
                 os.rmdir(m["pd"])
         except (SesError, OSError) as e:
-            print("no se pudo mover la memoria de %s: %s" % (m["folder"], e), file=sys.stderr)
+            rep.fail(m["folder"], e)
             rc = 1
+    rc = trash_flows(flows, rep) or rc
+    rep.summary()
     return rc
+
+
+def mem_row(m, msz):
+    nm = m["name"]
+    ident = os.path.basename(nm.rstrip("/")) if nm.startswith("/") else nm[-8:]
+    note = "viaja con la ultima sesion" if m["sessions"] else "sin sesiones"
+    return row("memoria", one_line(ident, 8), msz, "%s  %s" % (tilde(nm) if nm.startswith("/") else nm, note))
 
 
 def cmd_empty(a):

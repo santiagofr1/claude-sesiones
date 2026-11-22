@@ -181,7 +181,9 @@ class TestDeleteRestore(Base):
         before = self.snapshot()
         rc, out, _ = self.run_ses("delete", "dddd")
         self.assertEqual(rc, 0)
-        self.assertIn("ses restore dddd1111", out)
+        self.assertIn("dddd1111", out)
+        self.assertEqual(out.count("Para recuperar algo"), 1)  # el aviso va una sola vez, al final
+        self.assertIn("Todo quedo en la papelera", out.splitlines()[-1])
         t = os.path.join(self.root, "ses-papelera", U_ART)
         self.assertTrue(os.path.isfile(os.path.join(t, "sesion.jsonl")))
         for k in ("proyecto", "file-history", "session-env"):
@@ -198,8 +200,12 @@ class TestDeleteRestore(Base):
 
     def test_reject_active(self):
         self.mk(self.pa, U_ACTIVE, conv(self.alive), age_h=0)
-        rc, _, err = self.run_ses("delete", U_ACTIVE)
+        rc, out, err = self.run_ses("delete", U_ACTIVE)
         self.assertEqual(rc, 1)
+        self.assertIn("no se pudo  " + U_ACTIVE[:8], err)
+        self.assertIn("activa", err)
+        self.assertIn("1 no se pudo (activas)", out)
+        self.assertNotIn("Todo quedo en la papelera", out)  # no se movio nada
         self.assertTrue(os.path.exists(os.path.join(self.pa, U_ACTIVE + ".jsonl")))
 
     def test_partial_reject_continues(self):
@@ -227,7 +233,7 @@ class TestDeleteRestore(Base):
         open(os.path.join(mem, "MEMORY.md"), "w").write("nota")
         rc, out, _ = self.run_ses("delete", U_NORMAL)
         self.assertEqual(rc, 0)
-        self.assertIn("tambien se llevo la memoria", out)
+        self.assertRegex(out, r"(?m)^memoria .*con la ultima sesion")
         t = os.path.join(self.root, "ses-papelera", U_NORMAL)
         self.assertTrue(os.path.isfile(os.path.join(t, "artefactos", "memory", "MEMORY.md")))
         self.assertTrue(json.load(open(os.path.join(t, "meta.json")))["incluye_memoria"])
@@ -259,7 +265,7 @@ class TestDeleteRestore(Base):
         self.assertTrue(os.path.isfile(os.path.join(mem, "MEMORY.md")))
         # borrar las dos juntas: memory viaja con la ultima
         rc, out, _ = self.run_ses("delete", U_AMBIG)
-        self.assertIn("tambien se llevo la memoria", out)
+        self.assertRegex(out, r"(?m)^memoria .*con la ultima sesion")
         self.assertFalse(os.path.exists(mem))
 
     def test_memory_not_moved_if_last_rejected(self):
@@ -410,7 +416,7 @@ class TestOldMemory(Base):
         self.mk(self.pa, U_OLD, conv(self.alive), age_h=24 * 90)
         mem = self.mem(self.pa, 60)
         rc, out, _ = self.run_ses("old", "30")
-        self.assertIn("tambien se llevo la memoria", out)
+        self.assertRegex(out, r"(?m)^memoria .*con la ultima sesion")
         t = os.path.join(self.root, "ses-papelera", U_OLD, "artefactos", "memory", "m.md")
         self.assertTrue(os.path.isfile(t))
 
@@ -497,12 +503,20 @@ class TestFlow(Base):
         a = self.flow("proyA", age_days=1)
         rc, out, _ = self.run_ses("old", "30", "--dry-run")
         self.assertEqual(rc, 0)
+        self.assertIn("Se llevaria:", out)
         self.assertIn("1 .claude-flow", out)
+        self.assertIn(".claude-flow\nflow ", out)
+        self.assertIn("Modo --dry-run: no se modifico nada.", out)
+        self.assertNotIn("\r", out)
+        self.assertNotIn("Todo quedo", out)
         self.assertTrue(os.path.isdir(a))
         self.assertFalse(os.path.exists(os.path.join(self.root, "ses-papelera")))
         rc, out, _ = self.run_ses("old", "30")
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(a))
+        self.assertIn("Listo:", out)
+        self.assertEqual(out.count("Para recuperar algo"), 1)
+        self.assertNotIn("\r", out)
         rc, out, _ = self.run_ses("restore")
         self.assertIn("[flow]", out)
         short = [l for l in out.splitlines() if "[flow]" in l][0].split()[0]
@@ -513,6 +527,33 @@ class TestFlow(Base):
         rc, _, _ = self.run_ses("restore", short)
         self.assertEqual(rc, 0)
         self.assertTrue(os.path.isfile(os.path.join(a, "a.json")))
+
+    def test_find_progress_tty_only(self):
+        self.flow("proyA")
+        msgs = []
+        ses.find_flows(msgs.append)
+        self.assertTrue(any("buscando .claude-flow... 0 encontradas, revisando" in m for m in msgs))
+        self.assertTrue(any(m.startswith("midiendo") for m in msgs))
+
+    def test_status_line_only_on_tty(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            st = ses.Status()
+            st.update("hola", force=True)
+            st.clear()
+        self.assertEqual(buf.getvalue(), "")  # no TTY: sin \r
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        tty = Tty()
+        with contextlib.redirect_stdout(tty):
+            st = ses.Status()
+            st.update("x" * 500, force=True)
+            st.clear()
+        v = tty.getvalue()
+        self.assertTrue(v.startswith("\r") and v.endswith("\r"))
+        self.assertLess(max(len(x) for x in v.split("\r")), 200)
 
     def test_old_takes_all_flows_regardless_of_age(self):
         old = self.flow("viejo", age_days=40)
