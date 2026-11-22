@@ -11,12 +11,11 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 chmod 0755 "$STAGE"
 
-install -d "$STAGE/DEBIAN" "$STAGE/usr/bin" "$STAGE/usr/share/doc/claude-sesiones"
+install -d "$STAGE/DEBIAN" "$STAGE/usr/bin"
 
 # la versión se inyecta en la copia, no en el original
 sed "s/^VERSION = \"dev\"\$/VERSION = \"$VERSION\"/" "$ROOT/ses.py" > "$STAGE/usr/bin/ses"
 chmod 0755 "$STAGE/usr/bin/ses"
-install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/doc/claude-sesiones/copyright"
 
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: claude-sesiones

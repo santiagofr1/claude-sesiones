@@ -2,8 +2,6 @@
 
 **Gestor de sesiones de Claude Code: lista, busca, manda a la papelera y limpia lo que sobra.**
 
-[![Licencia: MIT](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
-
 Claude Code guarda cada sesión como un archivo dentro de `~/.claude/projects`, y con el tiempo eso se acumula
 en cientos de MB. No hay forma de borrar una sesión suelta, ni de sacar las que quedaron de proyectos que ya no
 existen. Y el plugin ruflo deja carpetas `.claude-flow` repartidas por todo el disco. `ses` te deja ver qué hay,
@@ -177,7 +175,3 @@ python3 -m unittest discover -s tests
 ```
 
 Los tests usan carpetas temporales con un `CLAUDE_HOME` propio. Nunca tocan tu `~/.claude` real.
-
-## Licencia
-
-MIT.
