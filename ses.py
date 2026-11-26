@@ -3,12 +3,15 @@
 import argparse
 import hashlib
 import collections
+import contextlib
+import io
 import json
 import os
 import re
 import shutil
 import sys
 import time
+import unicodedata
 from datetime import datetime
 
 VERSION = "dev"
@@ -652,8 +655,33 @@ def restore_entry(e):
 
 
 # ---------------------------------------------------------------- comandos
+def parse_dias(tok):
+    try:
+        d = int(tok)
+    except (TypeError, ValueError):
+        raise UsageError("<dias> tiene que ser un entero mayor a 0")
+    if d <= 0:
+        raise UsageError("<dias> tiene que ser un entero mayor a 0")
+    return d
+
+
 def cmd_list(a):
+    args = list(a.args)
+    dias = None
+    if args and args[0] == "all":
+        args.pop(0)
+    elif args and args[0] == "old":
+        if len(args) < 2:
+            raise UsageError("'list old' necesita los dias: ses list old <dias>")
+        dias = parse_dias(args[1])
+        del args[:2]
+    if len(args) > 1:
+        raise UsageError("sobran argumentos: %s" % " ".join(args[1:]))
+    a.texto = args[0] if args else None
     ss = scan()
+    if dias is not None:
+        lim = time.time() - dias * 86400
+        ss = [s for s in ss if s["mtime"] < lim]
     if a.orphans:
         ss = [s for s in ss if s["existe"] is False]
     if a.project:
@@ -692,6 +720,368 @@ def cmd_list(a):
         print("No hay sesiones que coincidan.")
     print("\n%d sesiones, %s en total" % (len(ss), human(sum(s["size"] for s in ss))))
     return 0
+
+
+_FOLD = {}
+
+
+def _fold_char(c):
+    f = _FOLD.get(c)
+    if f is None:
+        low = c.lower()
+        base = [x for x in unicodedata.normalize("NFKD", low) if not unicodedata.combining(x)]
+        f = base[0] if base and len(low) == 1 else (low[0] if low else c)
+        _FOLD[c] = f
+    return f
+
+
+def fold(t):
+    """Minusculas y sin tildes, letra por letra: el largo no cambia (sirve para ubicar el fragmento)."""
+    if t.isascii():
+        return t.lower()
+    return "".join(_fold_char(c) for c in t)
+
+
+def msg_text(obj):
+    """Texto escrito por el usuario o por Claude (sin salidas de herramientas)."""
+    t = obj.get("type")
+    if t == "user":
+        return real_text(obj)
+    if t != "assistant":
+        return None
+    msg = obj.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b["text"] for b in content
+                         if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
+    return None
+
+
+def session_text(path):
+    """Todos los mensajes de la sesion en un solo texto."""
+    parts = []
+    with open(path, "rb") as f:
+        for raw in f:
+            if b'"user"' not in raw and b'"assistant"' not in raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                txt = msg_text(obj)
+                if txt and txt.strip():
+                    parts.append(txt.strip())
+    return "\n".join(parts)
+
+
+def full_title(info):
+    for c in (info["custom"], info["lastp"],
+              info["first_real"][0] if info["first_real"] else None):
+        if c and c.strip():
+            return one_line(c, 200)
+    return "(sin titulo)"
+
+
+COMUNES = set("""
+que con los las del por para una uno unos unas como pero mas sin sus son esta este esto estos estas ese esa eso
+esos esas aca ahi alla hay muy tan todo toda todos todas otro otra otros otras cual cuales quien donde cuando
+porque pues entre sobre hasta desde tambien solo ser fue era sea estar estoy esta estan tiene tengo tener hace
+hacer hago puede puedo poder ver mira algo nada cada mismo misma bien asi ademas antes despues ahora luego aun
+the and for with that this from are was were you your have has not but all can will its
+""".split())
+
+
+def query_words(texto):
+    words = []
+    for w in fold(texto).split():
+        w = w.strip(".,;:!?\"'()[]{}")
+        if len(w) >= 3 and w not in COMUNES and w not in words:
+            words.append(w)
+    return words
+
+
+class Indice:
+    """Texto de todas las sesiones en memoria, para buscar muchas veces sin releer los archivos."""
+
+    def __init__(self, ss, progress=None):
+        self.items = []
+        for i, s in enumerate(ss, 1):
+            if progress:
+                progress("cargando sesiones... %d/%d" % (i, len(ss)))
+            try:
+                txt = session_text(s["path"])
+            except OSError:
+                continue
+            extra = "%s\n%s" % (s["info"]["custom"] or "", s["proyecto"])
+            title = full_title(s["info"])
+            self.items.append(dict(s=s, title=title, ltitle=fold(title), text=txt, low=fold(txt),
+                                   extra=fold(extra)))
+
+    def buscar(self, words):
+        """Sesiones donde aparece al menos una palabra: (item, {palabra: veces}), las mejores primero."""
+        out = []
+        for it in self.items:
+            hits = {}
+            for w in words:
+                n = it["low"].count(w) + it["extra"].count(w)
+                if n:
+                    hits[w] = n
+            if hits:
+                en_titulo = sum(1 for w in hits if w in it["ltitle"])
+                out.append((it, hits, en_titulo))
+        out.sort(key=lambda r: (-len(r[1]), -r[2], -sum(r[1].values()), -r[0]["s"]["mtime"]))
+        return [(it, h) for it, h, _ in out]
+
+    @staticmethod
+    def fragmento(it, words, ancho):
+        """Pedazo del texto alrededor de la primera coincidencia: (texto, inicio, fin) de lo resaltado."""
+        best = None
+        rara = None
+        for w in words:
+            n = it["low"].count(w)
+            if n and (rara is None or n < rara[0]):
+                rara = (n, w)
+        if rara:
+            best = (it["low"].find(rara[1]), len(rara[1]))
+        if best is None or ancho < 10:
+            return "", 0, 0
+        k, n = best
+        a = max(0, k - ancho // 3)
+        raw = it["text"][a:a + ancho * 2]
+        pre = " ".join(raw[:k - a].split())
+        if raw[:k - a][-1:].isspace():
+            pre += " "
+        if a > 0:
+            pre = "..." + pre
+        hit = " ".join(raw[k - a:k - a + n].split())
+        post = raw[k - a + n:]
+        post = (" " if post[:1].isspace() else "") + " ".join(post.split())
+        line = (pre + hit + post)[:ancho]
+        return line, len(pre), min(len(pre) + len(hit), len(line))
+
+
+def cmd_search(a):
+    if a.texto is None:
+        return search_interactivo(a)
+    words = query_words(a.texto)
+    if not words:
+        raise UsageError("pasa al menos una palabra de 3 letras o mas que no sea muy comun (que, para, con...)")
+    st = Status()
+    st.update("leyendo sesiones...", force=True)
+    ss = scan()
+    if a.project:
+        ss = [s for s in ss if a.project.lower() in s["proyecto"].lower()]
+    try:
+        found = Indice(ss, st.update).buscar(words)
+    finally:
+        st.clear()
+    if a.json:
+        print(json.dumps([dict(uuid=it["s"]["uuid"], titulo=it["title"], fecha=fmt_ts(it["s"]["mtime"]),
+                               mtime=it["s"]["mtime"], tamano=it["s"]["size"], proyecto=it["s"]["proyecto"],
+                               coincidencias=h) for it, h in found], ensure_ascii=False, indent=2))
+        return 0
+    if not found:
+        print("Ninguna sesion menciona: %s" % ", ".join(words))
+        return 0
+    for it, hits in found:
+        s = it["s"]
+        marks = " " + col("[activa]", "33") if is_active(s["mtime"]) else ""
+        print(col(s["uuid"], "1") + marks)
+        print("  titulo:     %s" % it["title"])
+        print("  fecha:      %s" % fmt_ts(s["mtime"]))
+        print("  tamano:     %s" % human(s["size"]))
+        print("  proyecto:   %s" % tilde(s["proyecto"]))
+        print("  coincide:   %s" % ", ".join("%s (%d)" % (w, n) for w, n in hits.items()))
+        print()
+    print("%s, %s en total" % (plural(len(found), "sesion", "sesiones"),
+                               human(sum(it["s"]["size"] for it, _ in found))))
+    return 0
+
+
+# ---------------------------------------------------------------- buscador interactivo
+def search_interactivo(a):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise UsageError("el buscador interactivo necesita una terminal; si no, ses search \"texto\"")
+    import curses
+    st = Status()
+    st.update("leyendo sesiones...", force=True)
+    ss = scan()
+    if a.project:
+        ss = [s for s in ss if a.project.lower() in s["proyecto"].lower()]
+    try:
+        idx = Indice(ss, st.update)
+    finally:
+        st.clear()
+    os.environ.setdefault("ESCDELAY", "25")
+    elegido = curses.wrapper(lambda scr: Buscador(scr, idx, curses).run())
+    if not elegido:
+        return 0
+    s = elegido["s"]
+    cwd = s["cwd"]
+    cmd = "cd %s && claude --resume %s" % (cwd or "<proyecto>", s["uuid"])
+    if not cwd or not os.path.isdir(cwd):
+        print("El proyecto de esa sesion ya no existe (%s).\nPara retomarla igual:\n  %s"
+              % (tilde(s["proyecto"]), cmd), file=sys.stderr)
+        return 1
+    if not shutil.which("claude"):
+        print("No encuentro 'claude' en el PATH. Para retomarla:\n  %s" % cmd, file=sys.stderr)
+        return 1
+    print("Retomando %s en %s" % (s["uuid"][:8], tilde(cwd)), flush=True)
+    os.chdir(cwd)
+    os.execvp("claude", ["claude", "--resume", s["uuid"]])
+
+
+class Buscador:
+    AYUDA = "arrows: move   Enter: resume   Tab: details   Ctrl-U: clear   Esc: quit"
+    PROMPT = "search: "
+
+    def __init__(self, scr, idx, curses):
+        self.scr, self.idx, self.c = scr, idx, curses
+        self.q = ""
+        self.sel = 0
+        self.top = 0
+        self.res = []
+        self.recientes = sorted(idx.items, key=lambda it: -it["s"]["mtime"])
+        curses.curs_set(1)
+        self.hl = curses.A_BOLD | curses.A_UNDERLINE
+        self.dim = curses.A_DIM
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_YELLOW, -1)
+            curses.init_pair(2, curses.COLOR_CYAN, -1)
+            self.hl = curses.color_pair(1) | curses.A_BOLD
+            self.dim = curses.color_pair(2)
+        except curses.error:
+            pass
+        self.filtrar()
+
+    def filtrar(self):
+        self.words = query_words(self.q)
+        if self.words:
+            self.res = self.idx.buscar(self.words)
+        else:
+            self.res = [(it, {}) for it in self.recientes]
+        self.sel = 0
+        self.top = 0
+
+    def put(self, y, x, txt, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and x < w - 1:
+            try:
+                self.scr.addnstr(y, x, txt, w - 1 - x, attr)
+            except self.c.error:
+                pass
+
+    def dibujar(self):
+        c, scr = self.c, self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        pl = len(self.PROMPT)
+        self.put(0, 0, self.PROMPT, c.A_BOLD)
+        self.put(0, pl, self.q)
+        if self.words:
+            info = plural(len(self.res), "session", "sessions")
+        elif self.q.strip():
+            info = "type at least 3 letters (very common words like 'que' or 'the' are ignored)"
+        else:
+            info = "%s, newest first" % plural(len(self.res), "session", "sessions")
+        self.put(1, 0, info + "   " + self.AYUDA, self.dim)
+        filas = max(1, (h - 3) // 2)
+        if self.sel < self.top:
+            self.top = self.sel
+        elif self.sel >= self.top + filas:
+            self.top = self.sel - filas + 1
+        y = 3
+        for i in range(self.top, min(len(self.res), self.top + filas)):
+            it, hits = self.res[i]
+            s = it["s"]
+            attr = c.A_REVERSE if i == self.sel else 0
+            head = "%s  %s  %8s  %s" % (s["uuid"][:8], fmt_ts(s["mtime"]), human(s["size"]), it["title"])
+            if is_active(s["mtime"]):
+                head += "  [active]"
+            self.put(y, 0, head.ljust(w - 1), attr)
+            if self.words:
+                frag, a, b = self.idx.fragmento(it, self.words, w - 6)
+                if not frag:
+                    frag, a, b = tilde(s["proyecto"]), 0, 0
+                self.put(y + 1, 4, frag[:a], self.dim)
+                self.put(y + 1, 4 + a, frag[a:b], self.hl)
+                self.put(y + 1, 4 + b, frag[b:], self.dim)
+            else:
+                self.put(y + 1, 4, tilde(s["proyecto"]), self.dim)
+            y += 2
+        if not self.res and self.words:
+            self.put(3, 0, "No session mentions: %s" % ", ".join(self.words))
+        scr.move(0, min(pl + len(self.q), w - 1))
+        scr.refresh()
+
+    def detalle(self, it):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_ver(argparse.Namespace(id=it["s"]["uuid"]))
+        lines = buf.getvalue().splitlines()
+        top = 0
+        self.c.curs_set(0)
+        while True:
+            self.scr.erase()
+            h, _ = self.scr.getmaxyx()
+            for k, ln in enumerate(lines[top:top + h - 1]):
+                self.put(k, 0, ln)
+            self.put(h - 1, 0, "arrows: scroll   any other key: back", self.dim)
+            self.scr.refresh()
+            ch = self.scr.getch()
+            if ch == self.c.KEY_DOWN and top + h - 1 < len(lines):
+                top += 1
+            elif ch == self.c.KEY_UP and top > 0:
+                top -= 1
+            elif ch != self.c.KEY_RESIZE:
+                break
+        self.c.curs_set(1)
+
+    def run(self):
+        c = self.c
+        while True:
+            self.dibujar()
+            try:
+                ch = self.scr.get_wch()
+            except c.error:
+                continue
+            n = len(self.res)
+            if ch in ("\x1b",):
+                return None
+            if ch in ("\n", "\r", c.KEY_ENTER):
+                if n:
+                    return self.res[self.sel][0]
+            elif ch == "\t":
+                if n:
+                    self.detalle(self.res[self.sel][0])
+            elif ch == c.KEY_DOWN:
+                self.sel = min(n - 1, self.sel + 1) if n else 0
+            elif ch == c.KEY_UP:
+                self.sel = max(0, self.sel - 1)
+            elif ch == c.KEY_NPAGE:
+                self.sel = min(n - 1, self.sel + 10) if n else 0
+            elif ch == c.KEY_PPAGE:
+                self.sel = max(0, self.sel - 10)
+            elif ch in (c.KEY_BACKSPACE, "\x7f", "\b"):
+                self.q = self.q[:-1]
+                self.filtrar()
+            elif ch == "\x15":
+                self.q = ""
+                self.filtrar()
+            elif ch == "\x17":
+                self.q = self.q.rstrip()
+                self.q = self.q[:self.q.rfind(" ") + 1] if " " in self.q else ""
+                self.filtrar()
+            elif ch == "\x03":
+                return None
+            elif isinstance(ch, str) and ch.isprintable():
+                self.q += ch
+                self.filtrar()
 
 
 def cmd_ver(a):
@@ -793,6 +1183,17 @@ def trash_many(sessions, mem_filter=None, rep=None):
 
 
 def cmd_borrar(a):
+    if a.ids[0] == "old":
+        if len(a.ids) != 2:
+            raise UsageError("uso: ses delete old <dias> [--dry-run] [--project SUBSTR]")
+        a.dias = parse_dias(a.ids[1])
+        return cmd_old(a)
+    if a.ids[0] == "junk":
+        if len(a.ids) != 1 or a.project:
+            raise UsageError("uso: ses delete junk [--dry-run]")
+        return cmd_junk(a)
+    if a.dry_run or a.project:
+        raise UsageError("--dry-run y --project van con 'delete old' o 'delete junk'")
     ss = scan()
     sel = []
     rc = 0
@@ -1057,8 +1458,6 @@ def newest_mtime(p):
 
 
 def cmd_old(a):
-    if a.dias <= 0:
-        raise UsageError("<dias> tiene que ser un entero mayor a 0")
     lim = time.time() - a.dias * 86400
     st = Status()
     st.update("leyendo sesiones...", force=True)
@@ -1199,29 +1598,38 @@ Las sesiones se mueven a una papelera (<raiz>/ses-papelera) y se pueden
 restaurar hasta que hagas 'ses empty'. Raiz: $CLAUDE_HOME (por defecto ~/.claude).
 
 Comandos:
-  ses list [texto] [--project SUBSTR] [--orphans] [--sort date|size] [--json]
+  ses list [all] [texto] [--project SUBSTR] [--orphans] [--sort date|size] [--json]
+  ses list old <dias> [texto] [...mismas opciones]
+  ses search [--project SUBSTR]              buscador interactivo
+  ses search "texto" [--project SUBSTR] [--json]
   ses show <id>
   ses delete <id> [<id>...]
+  ses delete old <dias> [--dry-run] [--project SUBSTR]
+  ses delete junk [--dry-run]
   ses restore [<id>]
-  ses junk [--dry-run]
-  ses old <dias> [--dry-run] [--project SUBSTR]
   ses empty [--dry-run]
 
 Notas:
-  'old' ademas manda a la papelera TODAS las carpetas .claude-flow (las crea el
-  plugin ruflo) bajo $HOME (o $SES_FLOW_ROOT), sin importar su antiguedad.
-  --project NO filtra flows y 'junk' no las toca. restore las lista como [flow].
+  'delete old' ademas manda a la papelera TODAS las carpetas .claude-flow (las
+  crea el plugin ruflo) bajo $HOME (o $SES_FLOW_ROOT), sin importar su antiguedad.
+  --project NO filtra flows y 'delete junk' no las toca. restore las lista como [flow].
+  'delete junk' se lleva todo lo roto o vacio, sin importar la edad.
 
 Ejemplos:
+  ses list all                   todas las sesiones
   ses list arduino --sort size   busca "arduino", las mas pesadas primero
+  ses list old 30                sesiones sin uso hace mas de 30 dias
   ses list --orphans             sesiones cuyo proyecto ya no existe
+  ses search                     buscador: tipeas y abajo salen las sesiones
+  ses search "bug login"         sesiones que mencionan "bug" o "login"
   ses show 3f2a                  detalle de una sesion (id o prefijo)
   ses delete 3f2a 9c1d           a la papelera
+  ses delete old 30 --dry-run    que se llevaria, sin tocar nada
+  ses delete old 30              sesiones de mas de 30 dias a la papelera
+  ses delete junk --dry-run      mira que basura hay, sin tocar nada
+  ses delete junk                manda la basura a la papelera
   ses restore                    lista la papelera
   ses restore 3f2a               vuelve todo a su lugar
-  ses junk --dry-run             mira que basura hay, sin tocar nada
-  ses junk                       manda la basura a la papelera
-  ses old 30 --dry-run           sesiones de mas de 30 dias, solo mostrar
   ses empty                      borra la papelera para siempre (irreversible)
 
 Si borrar deja a un proyecto sin sesiones, la carpeta memory/ del proyecto
@@ -1236,25 +1644,27 @@ def build():
                add_help=False)
     sp = p.add_subparsers(dest="cmd", parser_class=Parser)
     c = sp.add_parser("list", add_help=False)
-    c.add_argument("texto", nargs="?")
+    c.add_argument("args", nargs="*")
     c.add_argument("--project")
     c.add_argument("--orphans", action="store_true")
     c.add_argument("--sort", choices=("date", "size"), default="date")
     c.add_argument("--json", action="store_true")
+    c = sp.add_parser("search", add_help=False)
+    c.add_argument("texto", nargs="?")
+    c.add_argument("--project")
+    c.add_argument("--json", action="store_true")
     sp.add_parser("show", add_help=False).add_argument("id")
-    sp.add_parser("delete", add_help=False).add_argument("ids", nargs="+")
-    sp.add_parser("restore", add_help=False).add_argument("id", nargs="?")
-    sp.add_parser("junk", add_help=False).add_argument("--dry-run", action="store_true")
-    c = sp.add_parser("old", add_help=False)
-    c.add_argument("dias", type=int)
+    c = sp.add_parser("delete", add_help=False)
+    c.add_argument("ids", nargs="+")
     c.add_argument("--dry-run", action="store_true")
     c.add_argument("--project")
+    sp.add_parser("restore", add_help=False).add_argument("id", nargs="?")
     sp.add_parser("empty", add_help=False).add_argument("--dry-run", action="store_true")
     return p
 
 
-COMMANDS = {"list": cmd_list, "show": cmd_ver, "delete": cmd_borrar, "restore": cmd_restaurar,
-            "junk": cmd_junk, "old": cmd_old, "empty": cmd_empty}
+COMMANDS = {"list": cmd_list, "search": cmd_search, "show": cmd_ver, "delete": cmd_borrar, "restore": cmd_restaurar,
+            "empty": cmd_empty}
 
 
 def main(argv=None):

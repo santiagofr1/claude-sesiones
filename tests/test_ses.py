@@ -109,6 +109,76 @@ class Base(unittest.TestCase):
                 f.write("data")
 
 
+class TestSearch(Base):
+    def setUp(self):
+        super().setUp()
+        tool = line(type="user", cwd=self.alive, message={"role": "user", "content": [
+            {"type": "tool_result", "content": "zanahoria en la salida de una herramienta"}]})
+        resp = line(type="assistant", cwd=self.alive, message={"role": "assistant", "content": [
+            {"type": "text", "text": "La Calibración quedó lista, calibración ok"}]})
+        self.mk(self.pa, U_NORMAL, conv(self.alive, "arreglar el bug del login") + tool + "\n" + resp + "\n")
+        self.mk(self.pd, U_OLD, conv(self.dead, "revisar el login viejo"), age_h=24 * 60)
+        self.mk(self.pa, U_AMBIG, conv(self.alive, "nada que ver"))
+
+    def test_any_word_matches(self):
+        before = self.snapshot()
+        rc, out, _ = self.run_ses("search", "login perdido")
+        self.assertEqual(rc, 0)
+        self.assertIn(U_NORMAL, out)
+        self.assertIn(U_OLD, out)
+        self.assertNotIn(U_AMBIG, out)
+        self.assertIn("arreglar el bug del login", out)
+        self.assertIn("coincide:   login (1)", out)
+        self.assertIn("2 sesiones", out)
+        self.assertEqual(before, self.snapshot())
+
+    def test_more_words_first_and_json(self):
+        rc, out, _ = self.run_ses("search", "bug login", "--json")
+        data = json.loads(out)
+        self.assertEqual([d["uuid"] for d in data], [U_NORMAL, U_OLD])
+        self.assertEqual(data[0]["coincidencias"], {"bug": 1, "login": 1})
+        self.assertIn("fecha", data[0])
+        self.assertIn("tamano", data[0])
+
+    def test_accents_case_assistant_and_tools(self):
+        _, out, _ = self.run_ses("search", "CALIBRACION")
+        self.assertIn(U_NORMAL, out)
+        self.assertIn("calibracion (2)", out)
+        _, out, _ = self.run_ses("search", "zanahoria")
+        self.assertIn("Ninguna sesion", out)
+
+    def test_fold_keeps_length(self):
+        for t in ("Calibración ÁRBOL ñandú", "straße İ ok", "plain"):
+            self.assertEqual(len(ses.fold(t)), len(t))
+        self.assertEqual(ses.fold("Calibración"), "calibracion")
+
+    def test_indice_y_fragmento(self):
+        idx = ses.Indice(ses.scan())
+        res = idx.buscar(["calibracion"])
+        self.assertEqual([it["s"]["uuid"] for it, _ in res], [U_NORMAL])
+        frag, a, b = idx.fragmento(res[0][0], ["calibracion"], 40)
+        self.assertEqual(frag[a:b], "Calibración")
+        self.assertLessEqual(len(frag), 40)
+        self.assertEqual(idx.buscar(["inexistente"]), [])
+
+    def test_palabras_comunes_y_titulo(self):
+        self.assertEqual(ses.query_words("lo que quiero, para el LOGIN"), ["quiero", "login"])
+        rc, _, _ = self.run_ses("search", "lo que para")
+        self.assertEqual(rc, 2)
+        # empate en palabras y en titulo: gana la mas nueva
+        _, out, _ = self.run_ses("search", "login", "--json")
+        self.assertEqual([d["uuid"] for d in json.loads(out)], [U_NORMAL, U_OLD])
+
+    def test_project_filter_and_usage(self):
+        _, out, _ = self.run_ses("search", "login", "--project", "muerto")
+        self.assertIn(U_OLD, out)
+        self.assertNotIn(U_NORMAL, out)
+        rc, _, _ = self.run_ses("search", "de a")
+        self.assertEqual(rc, 2)
+        rc, _, _ = self.run_ses("search")
+        self.assertEqual(rc, 2)
+
+
 class TestListAndResolve(Base):
     def setUp(self):
         super().setUp()
@@ -165,12 +235,37 @@ class TestListAndResolve(Base):
             self.assertEqual(out.strip(), "ses " + ses.VERSION)
 
     def test_usage_error(self):
-        rc, _, _ = self.run_ses("old", "abc")
+        rc, _, _ = self.run_ses("delete", "old", "abc")
         self.assertEqual(rc, 2)
-        rc, _, _ = self.run_ses("old", "0")
+        rc, _, _ = self.run_ses("delete", "old", "0")
         self.assertEqual(rc, 2)
         rc, _, _ = self.run_ses("nada")
         self.assertEqual(rc, 2)
+        before = self.snapshot()
+        for args in (("delete", "old"), ("delete", "old", "30", "extra"), ("delete", "junk", "x"),
+                     ("delete", "junk", "--project", "a"), ("delete", "aaaa1", "--dry-run"),
+                     ("list", "old"), ("list", "old", "x"), ("list", "old", "-3"),
+                     ("list", "a", "b"), ("old", "30"), ("junk",)):
+            rc, _, _ = self.run_ses(*args)
+            self.assertEqual(rc, 2, args)
+        self.assertEqual(before, self.snapshot())
+
+    def test_list_all_and_old(self):
+        rc, out, _ = self.run_ses("list", "all")
+        self.assertEqual(rc, 0)
+        self.assertIn("4 sesiones", out)
+        _, out, _ = self.run_ses("list", "all", "LOGIN")
+        self.assertIn("1 sesiones", out)
+        before = self.snapshot()
+        rc, out, _ = self.run_ses("list", "old", "30")
+        self.assertEqual(rc, 0)
+        self.assertIn("sesion vieja", out)
+        self.assertIn("1 sesiones", out)
+        self.assertEqual(before, self.snapshot())
+        _, out, _ = self.run_ses("list", "old", "90")
+        self.assertIn("0 sesiones", out)
+        _, out, _ = self.run_ses("list", "old", "30", "vieja", "--json")
+        self.assertEqual([d["uuid"] for d in json.loads(out)], [U_OLD])
 
 
 class TestDeleteRestore(Base):
@@ -316,18 +411,18 @@ class TestJunkOldEmpty(Base):
 
     def test_dry_run_changes_nothing(self):
         before = self.snapshot()
-        rc, out, _ = self.run_ses("junk", "--dry-run")
+        rc, out, _ = self.run_ses("delete", "junk", "--dry-run")
         self.assertEqual(rc, 0)
         for w in ("0 bytes", "JSON valida", "vacia", "huerfano", "proyecto vacio"):
             self.assertIn(w, out)
         self.assertEqual(before, self.snapshot())
-        self.run_ses("old", "30", "--dry-run")
+        self.run_ses("delete", "old", "30", "--dry-run")
         self.assertEqual(before, self.snapshot())
         self.run_ses("delete", "--help")
         self.assertEqual(before, self.snapshot())
 
     def test_junk_acts(self):
-        rc, out, _ = self.run_ses("junk")
+        rc, out, _ = self.run_ses("delete", "junk")
         self.assertEqual(rc, 1)  # la activa de 0 bytes se rechaza
         pap = os.path.join(self.root, "ses-papelera")
         for u in (U_EMPTY, U_BROKEN, U_ZERO):
@@ -348,7 +443,7 @@ class TestJunkOldEmpty(Base):
         self.assertTrue(os.path.isfile(os.path.join(self.pcm, "memory", "m.md")))
 
     def test_old(self):
-        rc, out, _ = self.run_ses("old", "30")
+        rc, out, _ = self.run_ses("delete", "old", "30")
         self.assertEqual(rc, 0)
         self.assertIn("cccc1111", out)
         self.assertTrue(os.path.isdir(os.path.join(self.root, "ses-papelera", U_OLD)))
@@ -356,7 +451,7 @@ class TestJunkOldEmpty(Base):
         self.assertTrue(os.path.exists(os.path.join(self.pa, U_NORMAL + ".jsonl")))
 
     def test_old_project_filter(self):
-        rc, out, _ = self.run_ses("old", "30", "--project", "zzz")
+        rc, out, _ = self.run_ses("delete", "old", "30", "--project", "zzz")
         self.assertNotIn("cccc1111", out)
         self.assertTrue(os.path.exists(os.path.join(self.pd, U_OLD + ".jsonl")))
 
@@ -386,10 +481,10 @@ class TestOldMemory(Base):
     def test_old_memory_no_sessions(self):
         p = self.proj("-sin-sesiones")
         mem = self.mem(p, 60)
-        rc, out, _ = self.run_ses("old", "30", "--dry-run")
+        rc, out, _ = self.run_ses("delete", "old", "30", "--dry-run")
         self.assertIn("memoria", out)
         self.assertTrue(os.path.isdir(mem))
-        rc, out, _ = self.run_ses("old", "30")
+        rc, out, _ = self.run_ses("delete", "old", "30")
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(p))
         rc, out, _ = self.run_ses("restore")
@@ -405,7 +500,7 @@ class TestOldMemory(Base):
     def test_orphan_memory_restore_refuses_if_exists(self):
         p = self.proj("-sin-sesiones")
         mem = self.mem(p, 60)
-        self.run_ses("old", "30")
+        self.run_ses("delete", "old", "30")
         self.mem(p, 0)
         rc, out, _ = self.run_ses("restore")
         short = [l for l in out.splitlines() if "[memoria]" in l][0].split()[0]
@@ -415,7 +510,7 @@ class TestOldMemory(Base):
     def test_old_memory_with_old_sessions_goes_with_last(self):
         self.mk(self.pa, U_OLD, conv(self.alive), age_h=24 * 90)
         mem = self.mem(self.pa, 60)
-        rc, out, _ = self.run_ses("old", "30")
+        rc, out, _ = self.run_ses("delete", "old", "30")
         self.assertRegex(out, r"(?m)^memoria .*con la ultima sesion")
         t = os.path.join(self.root, "ses-papelera", U_OLD, "artefactos", "memory", "m.md")
         self.assertTrue(os.path.isfile(t))
@@ -424,7 +519,7 @@ class TestOldMemory(Base):
         self.mk(self.pa, U_OLD, conv(self.alive), age_h=24 * 90)
         self.mk(self.pa, U_NORMAL, conv(self.alive), age_h=2)
         mem = self.mem(self.pa, 60)
-        self.run_ses("old", "30")
+        self.run_ses("delete", "old", "30")
         self.assertTrue(os.path.isfile(os.path.join(mem, "m.md")))
         self.assertTrue(os.path.isdir(os.path.join(self.root, "ses-papelera", U_OLD)))
 
@@ -432,7 +527,7 @@ class TestOldMemory(Base):
         self.mk(self.pa, U_OLD, conv(self.alive), age_h=24 * 90)
         mem = self.mem(self.pa, 60)
         self.mem(self.pa, 1, files=("nuevo.md",))
-        rc, out, _ = self.run_ses("old", "30")
+        rc, out, _ = self.run_ses("delete", "old", "30")
         self.assertTrue(os.path.isfile(os.path.join(mem, "nuevo.md")))
         self.assertTrue(os.path.isfile(os.path.join(mem, "m.md")))
         # y no se movio ninguna memoria sin sesiones
@@ -447,7 +542,7 @@ class TestOldMemory(Base):
             ph = self.proj(ses_enc(home))
             self.mk(ph, U_OLD, conv(home), age_h=24 * 90)
             mem = self.mem(ph, 60)
-            rc, out, _ = self.run_ses("old", "30")
+            rc, out, _ = self.run_ses("delete", "old", "30")
             self.assertIn("memoria protegida (home)", out)
             self.assertTrue(os.path.isfile(os.path.join(mem, "m.md")))
             self.assertTrue(os.path.isdir(ph))
@@ -458,7 +553,7 @@ class TestOldMemory(Base):
             self.assertIn("memoria protegida (home)", out)
             self.assertTrue(os.path.isfile(os.path.join(mem, "m.md")))
             # y junk con proyecto sin sesiones
-            rc, out, _ = self.run_ses("junk")
+            rc, out, _ = self.run_ses("delete", "junk")
             self.assertTrue(os.path.isfile(os.path.join(mem, "m.md")))
             # desactivable
             os.environ["SES_PROTEGER_HOME"] = "0"
@@ -501,7 +596,7 @@ class TestFlow(Base):
 
     def test_dry_run_act_and_restore(self):
         a = self.flow("proyA", age_days=1)
-        rc, out, _ = self.run_ses("old", "30", "--dry-run")
+        rc, out, _ = self.run_ses("delete", "old", "30", "--dry-run")
         self.assertEqual(rc, 0)
         self.assertIn("Se llevaria:", out)
         self.assertIn("1 .claude-flow", out)
@@ -511,7 +606,7 @@ class TestFlow(Base):
         self.assertNotIn("Todo quedo", out)
         self.assertTrue(os.path.isdir(a))
         self.assertFalse(os.path.exists(os.path.join(self.root, "ses-papelera")))
-        rc, out, _ = self.run_ses("old", "30")
+        rc, out, _ = self.run_ses("delete", "old", "30")
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(a))
         self.assertIn("Listo:", out)
@@ -558,20 +653,20 @@ class TestFlow(Base):
     def test_old_takes_all_flows_regardless_of_age(self):
         old = self.flow("viejo", age_days=40)
         new = self.flow("nuevo", age_days=0)
-        rc, out, _ = self.run_ses("old", "30", "--dry-run", "--project", "zzz")
+        rc, out, _ = self.run_ses("delete", "old", "30", "--dry-run", "--project", "zzz")
         self.assertIn("viejo", out)
         self.assertIn("nuevo", out)
         self.assertTrue(os.path.isdir(old))
         self.assertTrue(os.path.isdir(new))
-        self.run_ses("old", "30", "--project", "zzz")  # --project no filtra flows
+        self.run_ses("delete", "old", "30", "--project", "zzz")  # --project no filtra flows
         self.assertFalse(os.path.exists(old))
         self.assertFalse(os.path.exists(new))
 
     def test_junk_ignores_flow_and_empty_removes(self):
         a = self.flow("proyA")
-        self.run_ses("junk")
+        self.run_ses("delete", "junk")
         self.assertTrue(os.path.isdir(a))
-        self.run_ses("old", "30")
+        self.run_ses("delete", "old", "30")
         rc, _, _ = self.run_ses("empty")
         self.assertEqual(rc, 0)
         self.assertEqual(os.listdir(os.path.join(self.root, "ses-papelera")), [])
